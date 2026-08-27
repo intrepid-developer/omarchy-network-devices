@@ -1,0 +1,412 @@
+#!/usr/bin/env python3
+"""Discover LAN hosts via mDNS (avahi) and emit JSON for the Omarchy LAN plugin."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+from typing import Any
+
+MAX_HOSTS = 80
+AVAHI_TIMEOUT_SEC = 5.0
+
+UUID_RE = re.compile(
+    r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$"
+)
+HEX_BLOB_RE = re.compile(r"^[0-9A-Fa-f]{12,}$")
+IP_LOCAL_RE = re.compile(r"^\d+-\d+-\d+-\d+\.local$", re.I)
+IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+
+# Prefer friendlier service names when several advertise on one IP.
+SERVICE_PRIORITY = {
+    "_companion-link._tcp": 100,
+    "AirPlay Remote Video": 90,
+    "AirTunes Remote Audio": 85,
+    "SSH Remote Terminal": 80,
+    "SFTP File Transfer": 75,
+    "Amazon Fire TV": 70,
+    "_sonos._tcp": 65,
+    "_spotify-connect._tcp": 60,
+    "_hap._tcp": 40,
+    "_eero._tcp": 35,
+    "_eerogw._tcp": 34,
+    "_eero-ebid._tcp": 33,
+    "_sleep-proxy._udp": 20,
+    "_meshcop._udp": 15,
+    "_trel._udp": 10,
+    "_remotepairing._tcp": 50,
+    "_srpl-tls._tcp": 45,
+    "_asquic._udp": 55,
+}
+
+
+def which(name: str) -> str | None:
+    return shutil.which(name)
+
+
+def unescape_avahi(value: str) -> str:
+    """Decode avahi-browse parsable escapes (\\032 space, \\226\\128\\153 UTF-8, …)."""
+
+    def repl(match: re.Match[str]) -> str:
+        return chr(int(match.group(1), 10))
+
+    raw = re.sub(r"\\(\d{3})", repl, value or "")
+    try:
+        return raw.encode("latin-1").decode("utf-8")
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        return raw
+
+
+def clean_display_name(name: str) -> str:
+    text = unescape_avahi(name).strip()
+    # Drop AirPlay "MAC@Name" / "id@Name" prefixes when the rest is human.
+    if "@" in text:
+        left, right = text.split("@", 1)
+        if right and (HEX_BLOB_RE.match(left.replace(":", "")) or len(left) <= 16):
+            text = right.strip()
+    # Sonos: RINCON_…@Living Room
+    if text.upper().startswith("RINCON_") and "@" in text:
+        text = text.split("@", 1)[1].strip()
+    text = text.replace("___", "'").replace("_", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def is_junk_name(name: str) -> bool:
+    if not name:
+        return True
+    if UUID_RE.match(name):
+        return True
+    if HEX_BLOB_RE.match(name.replace(":", "").replace("-", "")):
+        return True
+    if name.startswith("amzn.dmgr") or name.startswith("sonosRINCON_"):
+        return True
+    if name.startswith("HomePodSensor "):
+        return True
+    if name.startswith("70-35-60-63"):
+        return True
+    return False
+
+
+def local_from_host(host: str) -> str:
+    host = (host or "").strip()
+    if not host:
+        return ""
+    if host.endswith(".local"):
+        return host
+    return host + ".local"
+
+
+def short_host(local: str) -> str:
+    if local.endswith(".local"):
+        return local[: -len(".local")]
+    return local
+
+
+def service_score(service: str) -> int:
+    return SERVICE_PRIORITY.get(service, 30)
+
+
+def name_score(name: str, local: str) -> int:
+    score = 0
+    if not name:
+        return -50
+    if is_junk_name(name):
+        return -40
+    if IP_LOCAL_RE.match(local):
+        score -= 10
+    if name.lower() == short_host(local).lower().replace("-", " "):
+        score += 5
+    if " " in name or "'" in name:
+        score += 8
+    if len(name) <= 28:
+        score += 3
+    return score
+
+
+def parse_txt_fields(fields: list[str]) -> dict[str, str]:
+    blob = " ".join(fields[9:]) if len(fields) > 9 else ""
+    out: dict[str, str] = {}
+    for match in re.finditer(r'"([^"=]+)=([^"]*)"', blob):
+        out[match.group(1)] = unescape_avahi(match.group(2)).strip()
+    return out
+
+
+def default_iface() -> tuple[str, str]:
+    """Return (iface, ipv4) for the default route, preferring physical LAN."""
+    try:
+        out = subprocess.check_output(
+            ["ip", "-4", "route", "show", "default"],
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "", ""
+    for line in out.splitlines():
+        parts = line.split()
+        if "dev" not in parts or "src" not in parts:
+            continue
+        iface = parts[parts.index("dev") + 1]
+        src = parts[parts.index("src") + 1]
+        if iface.startswith(("docker", "br-", "veth", "virbr", "nord", "tun", "wg")):
+            continue
+        return iface, src
+    return "", ""
+
+
+def gateway_ip() -> str:
+    try:
+        out = subprocess.check_output(
+            ["ip", "-4", "route", "show", "default"],
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    for line in out.splitlines():
+        parts = line.split()
+        if parts and parts[0] == "default" and "via" in parts:
+            return parts[parts.index("via") + 1]
+    return ""
+
+
+def self_host(iface: str, ip: str) -> dict[str, Any]:
+    hostname = socket.gethostname().split(".")[0] or "this"
+    local = f"{hostname}.local"
+    return {
+        "id": ip or local,
+        "name": hostname,
+        "hostname": hostname,
+        "local": local,
+        "ip": ip,
+        "kind": "this",
+        "self": True,
+        "iface": iface,
+    }
+
+
+def merge_host(bucket: dict[str, dict[str, Any]], candidate: dict[str, Any]) -> None:
+    key = candidate.get("ip") or candidate.get("local") or candidate.get("name")
+    if not key:
+        return
+    existing = bucket.get(key)
+    if not existing:
+        bucket[key] = candidate
+        return
+    # Prefer better display name / local hostname.
+    if name_score(candidate["name"], candidate["local"]) > name_score(
+        existing["name"], existing["local"]
+    ):
+        existing["name"] = candidate["name"]
+    if candidate["local"] and (
+        not existing["local"]
+        or IP_LOCAL_RE.match(existing["local"])
+        or (not IP_LOCAL_RE.match(candidate["local"]) and len(candidate["local"]) < len(existing["local"]))
+    ):
+        if not IP_LOCAL_RE.match(candidate["local"]) or not existing["local"]:
+            existing["local"] = candidate["local"]
+            existing["hostname"] = short_host(candidate["local"])
+    if candidate.get("kind"):
+        existing["kind"] = prefer_kind(str(existing.get("kind") or "other"), str(candidate["kind"]))
+    if candidate.get("score", 0) > existing.get("score", 0):
+        existing["score"] = candidate["score"]
+
+
+KIND_RANK = {
+    "this": 100,
+    "router": 90,
+    "computer": 80,
+    "phone": 70,
+    "tablet": 70,
+    "tv": 60,
+    "speaker": 50,
+    "other": 0,
+}
+
+
+def classify(name: str, service: str, local: str, txt: dict[str, str] | None = None) -> str:
+    txt = txt or {}
+    model = str(txt.get("am") or txt.get("md") or txt.get("model") or "").lower()
+    blob = f"{name} {service} {local} {model} {txt.get('n', '')}".lower()
+    if "homepod" in blob or "audioaccessory" in blob or "sonos" in blob:
+        return "speaker"
+    if model.startswith("mac") or "macbook" in blob or "imac" in blob:
+        return "computer"
+    if "appletv" in blob or "fire tv" in blob or "living-room" in blob or "living room" in blob:
+        return "tv"
+    if "iphone" in blob or "ipad" in blob:
+        return "phone" if "iphone" in blob else "tablet"
+    if (
+        "mac mini" in blob
+        or "mac studio" in blob
+        or "mac pro" in blob
+        or service.startswith("SSH")
+        or service.startswith("SFTP")
+    ):
+        return "computer"
+    if "eero" in blob or "gateway" in blob or "router" in blob:
+        return "router"
+    return "other"
+
+
+def prefer_kind(current: str, incoming: str) -> str:
+    cur = current or "other"
+    nxt = incoming or "other"
+    return nxt if KIND_RANK.get(nxt, 0) > KIND_RANK.get(cur, 0) else cur
+
+
+def parse_avahi(text: str) -> dict[str, dict[str, Any]]:
+    hosts: dict[str, dict[str, Any]] = {}
+    for line in text.splitlines():
+        if not line.startswith("="):
+            continue
+        fields = line.split(";")
+        if len(fields) < 9:
+            continue
+        if fields[2] != "IPv4":
+            continue
+        service = unescape_avahi(fields[4])
+        name = clean_display_name(fields[3])
+        host = unescape_avahi(fields[6])
+        ip = fields[7].strip()
+        if not IPV4_RE.match(ip):
+            continue
+        txt = parse_txt_fields(fields)
+        txt_name = txt.get("n", "")
+        if txt_name and (is_junk_name(name) or name_score(txt_name, local_from_host(host)) >= name_score(name, local_from_host(host))):
+            name = clean_display_name(txt_name)
+        local = local_from_host(host)
+        if is_junk_name(name):
+            name = short_host(local).replace("-", " ") if local else ip
+        score = service_score(service) + name_score(name, local)
+        merge_host(
+            hosts,
+            {
+                "id": ip,
+                "name": name,
+                "hostname": short_host(local),
+                "local": local,
+                "ip": ip,
+                "kind": classify(name, service, local, txt),
+                "self": False,
+                "score": score,
+            },
+        )
+    return hosts
+
+
+def scan_avahi() -> tuple[dict[str, dict[str, Any]], str | None]:
+    binary = which("avahi-browse")
+    if not binary:
+        return {}, "avahi-browse not found (install avahi)"
+    try:
+        proc = subprocess.run(
+            [binary, "-artp"],
+            capture_output=True,
+            text=True,
+            timeout=AVAHI_TIMEOUT_SEC,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        text = (exc.stdout or "") if isinstance(exc.stdout, str) else (exc.stdout or b"").decode("utf-8", "replace")
+        return parse_avahi(text), None
+    except OSError as exc:
+        return {}, str(exc)
+    if proc.returncode not in (0, None) and not proc.stdout:
+        err = (proc.stderr or "").strip() or f"avahi-browse exited {proc.returncode}"
+        return {}, err
+    return parse_avahi(proc.stdout or ""), None
+
+
+def ensure_gateway(hosts: dict[str, dict[str, Any]]) -> None:
+    gw = gateway_ip()
+    if not gw or not IPV4_RE.match(gw):
+        return
+    if gw in hosts:
+        if hosts[gw].get("kind") == "other":
+            hosts[gw]["kind"] = "router"
+        return
+    hosts[gw] = {
+        "id": gw,
+        "name": "Gateway",
+        "hostname": "",
+        "local": "",
+        "ip": gw,
+        "kind": "router",
+        "self": False,
+        "score": 0,
+    }
+
+
+def finalize(hosts: dict[str, dict[str, Any]], self_entry: dict[str, Any]) -> list[dict[str, Any]]:
+    if self_entry.get("ip"):
+        existing = hosts.get(self_entry["ip"])
+        if existing:
+            existing["self"] = True
+            existing["kind"] = "this"
+            if not existing.get("name") or is_junk_name(existing["name"]):
+                existing["name"] = self_entry["name"]
+            if not existing.get("local"):
+                existing["local"] = self_entry["local"]
+                existing["hostname"] = self_entry["hostname"]
+        else:
+            hosts[self_entry["ip"]] = self_entry
+
+    rows = list(hosts.values())
+    rows.sort(
+        key=lambda h: (
+            0 if h.get("self") else 1,
+            0 if h.get("kind") == "router" else 1,
+            str(h.get("name") or "").lower(),
+            str(h.get("ip") or ""),
+        )
+    )
+    out = []
+    for row in rows[:MAX_HOSTS]:
+        out.append(
+            {
+                "id": row.get("id") or row.get("ip") or row.get("local"),
+                "name": row.get("name") or row.get("hostname") or row.get("ip") or "Unknown",
+                "hostname": row.get("hostname") or "",
+                "local": row.get("local") or "",
+                "ip": row.get("ip") or "",
+                "kind": row.get("kind") or "other",
+                "self": bool(row.get("self")),
+            }
+        )
+    return out
+
+
+def cmd_scan() -> int:
+    iface, ip = default_iface()
+    hosts, error = scan_avahi()
+    ensure_gateway(hosts)
+    payload = {
+        "iface": iface,
+        "selfIp": ip,
+        "hosts": finalize(hosts, self_host(iface, ip)),
+        "error": error,
+    }
+    json.dump(payload, sys.stdout, separators=(",", ":"))
+    sys.stdout.write("\n")
+    return 0 if not error else 1
+
+
+def main(argv: list[str]) -> int:
+    action = argv[1] if len(argv) > 1 else "scan"
+    if action in ("-h", "--help", "help"):
+        print("Usage: lan-hosts [scan]", file=sys.stderr)
+        return 0
+    if action != "scan":
+        print(json.dumps({"error": f"unknown command: {action}", "hosts": []}))
+        return 2
+    return cmd_scan()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

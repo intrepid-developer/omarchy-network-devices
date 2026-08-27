@@ -1,0 +1,53 @@
+{
+  "schemaVersion": 1,
+  "id": "chris.lan",
+  "name": "LAN",
+  "version": "1.0.0",
+  "author": "Chris Vanderplank",
+  "license": "MIT",
+  "description": "Browse machines on the local network with IP and .local addresses via mDNS.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "LAN",
+    "description": "Local network hosts with IP and .local names.",
+    "category": "Network",
+    "aliases": [
+      "lan",
+      "hosts",
+      "mdns",
+      "bonjour"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 60,
+      "showCount": "On"
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 15,
+        "max": 600,
+        "step": 15,
+        "defaultValue": 60
+      },
+      {
+        "key": "showCount",
+        "type": "enum",
+        "label": "Show host count on bar",
+        "options": [
+          "On",
+          "Off"
+        ],
+        "defaultValue": "On"
+      }
+    ]
+  }
+}
