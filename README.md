@@ -25,8 +25,8 @@ omarchy plugin add https://github.com/intrepid-developer/omarchy-network-devices
 IPC:
 
 ```sh
-omarchy-shell shell summon chris.network-devices '{}'
-omarchy-shell shell hide chris.network-devices
+omarchy-shell shell summon network-devices.plugin '{}'
+omarchy-shell shell hide network-devices.plugin
 ```
 
 ## Configure
@@ -37,9 +37,9 @@ omarchy-shell shell hide chris.network-devices
 | `showCount` | `On` | Show the host count next to the bar icon |
 
 ```sh
-omarchy bar set chris.network-devices refreshIntervalSec 30
-omarchy bar set chris.network-devices showCount Off
-omarchy bar move chris.network-devices --section right
+omarchy bar set network-devices.plugin refreshIntervalSec 30
+omarchy bar set network-devices.plugin showCount Off
+omarchy bar move network-devices.plugin --section right
 ```
 
 ## Requirements
@@ -51,7 +51,7 @@ omarchy bar move chris.network-devices --section right
 ## Remove
 
 ```sh
-omarchy plugin remove chris.network-devices
+omarchy plugin remove network-devices.plugin
 ```
 
 ## License

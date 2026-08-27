@@ -8,8 +8,8 @@ import "Model.js" as Model
 
 Panel {
   id: root
-  moduleName: "chris.network-devices"
-  ipcTarget: "chris.network-devices"
+  moduleName: "network-devices.plugin"
+  ipcTarget: "network-devices.plugin"
   manageIpc: false
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground

@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "id": "chris.network-devices",
+  "id": "network-devices.plugin",
   "name": "Network Devices",
   "version": "1.0.0",
   "author": "Chris Vanderplank",
