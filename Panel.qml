@@ -8,8 +8,8 @@ import "Model.js" as Model
 
 Panel {
   id: root
-  moduleName: "chris.lan"
-  ipcTarget: "chris.lan"
+  moduleName: "chris.network-devices"
+  ipcTarget: "chris.network-devices"
   manageIpc: false
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
@@ -111,9 +111,9 @@ Panel {
   }
 
   function barTooltip() {
-    if (errorText !== "") return "LAN — " + errorText
-    if (!everScanned) return "LAN hosts"
-    return countText + " LAN host" + (hosts.length === 1 ? "" : "s")
+    if (errorText !== "") return "Network Devices — " + errorText
+    if (!everScanned) return "Network devices"
+    return countText + " network device" + (hosts.length === 1 ? "" : "s")
   }
 
   implicitWidth: barFace.implicitWidth
@@ -248,7 +248,7 @@ Panel {
             spacing: Style.space(2)
 
             Text {
-              text: "LAN"
+              text: "Network Devices"
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.title

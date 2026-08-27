@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
-  "id": "chris.lan",
-  "name": "LAN",
+  "id": "chris.network-devices",
+  "name": "Network Devices",
   "version": "1.0.0",
   "author": "Chris Vanderplank",
   "license": "MIT",
@@ -13,10 +13,11 @@
     "barWidget": "Panel.qml"
   },
   "barWidget": {
-    "displayName": "LAN",
+    "displayName": "Network Devices",
     "description": "Local network hosts with IP and .local names.",
     "category": "Network",
     "aliases": [
+      "network-devices",
       "lan",
       "hosts",
       "mdns",
