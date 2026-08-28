@@ -69,6 +69,13 @@ Panel {
   function applyScan(text) {
     scanning = false
     everScanned = true
+    if (Model.wasCapped(text)) {
+      var capped = Model.parseJson(text, null)
+      if (!capped) {
+        errorText = Model.clean("Scan output truncated", 160)
+        return
+      }
+    }
     var parsed = Model.normalizeHosts(Model.parseJson(text, {}))
     hosts = parsed.hosts
     iface = parsed.iface
@@ -146,7 +153,7 @@ Panel {
     command: [root.helper, "scan"]
     stdout: SplitParser {
       splitMarker: ""
-      onRead: function(data) { root.scanStdout += String(data || "") }
+      onRead: function(data) { root.scanStdout = Model.appendCapped(root.scanStdout, data) }
     }
     onExited: function(exitCode) {
       root.applyScan(root.scanStdout)
@@ -253,6 +260,7 @@ Panel {
               font.family: root.fontFamily
               font.pixelSize: Style.font.title
               font.bold: true
+              textFormat: Text.PlainText
               elide: Text.ElideRight
               width: parent.width
             }
@@ -264,6 +272,7 @@ Panel {
               font.pixelSize: Style.font.caption
               font.bold: true
               font.letterSpacing: 1.2
+              textFormat: Text.PlainText
               elide: Text.ElideRight
               width: parent.width
             }
@@ -291,6 +300,7 @@ Panel {
           color: root.bar ? root.bar.urgent : Color.urgent
           font.family: root.fontFamily
           font.pixelSize: Style.font.bodySmall
+          textFormat: Text.PlainText
           wrapMode: Text.WordWrap
         }
 
@@ -301,6 +311,7 @@ Panel {
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.bodySmall
+          textFormat: Text.PlainText
           wrapMode: Text.WordWrap
         }
 
@@ -364,6 +375,7 @@ Panel {
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.body
                   font.bold: modelData.self === true
+                  textFormat: Text.PlainText
                   elide: Text.ElideRight
                 }
 
@@ -374,6 +386,7 @@ Panel {
                   color: root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
+                  textFormat: Text.PlainText
                   elide: Text.ElideRight
                 }
               }
@@ -398,9 +411,21 @@ Panel {
             }
 
             PanelToolTip {
+              id: hostTip
               visible: rowMouse.containsMouse
               text: Model.hostTooltip(modelData) + "\nClick: copy IP · Right-click: copy .local"
               fontFamily: root.fontFamily
+              contentItem: Text {
+                text: hostTip.text
+                color: hostTip.panelForeground
+                font.family: hostTip.fontFamily
+                font.pixelSize: hostTip.fontSize
+                textFormat: Text.PlainText
+                leftPadding: Border.left(hostTip.panelBorderSpec) + Style.spacing.controlPaddingX
+                rightPadding: Border.right(hostTip.panelBorderSpec) + Style.spacing.controlPaddingX
+                topPadding: Border.top(hostTip.panelBorderSpec) + Style.spacing.controlPaddingY
+                bottomPadding: Border.bottom(hostTip.panelBorderSpec) + Style.spacing.controlPaddingY
+              }
             }
           }
         }

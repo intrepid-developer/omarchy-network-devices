@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "network-devices.plugin",
   "name": "Network Devices",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "Chris Vanderplank",
   "license": "MIT",
   "description": "Browse machines on the local network with IP and .local addresses via mDNS.",

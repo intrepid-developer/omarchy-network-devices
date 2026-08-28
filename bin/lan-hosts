@@ -4,15 +4,18 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import shutil
 import socket
 import subprocess
 import sys
+import threading
 from typing import Any
 
 MAX_HOSTS = 80
+MAX_AVAHI_BYTES = 512 * 1024
+MAX_NAME_LEN = 64
+MAX_FIELD_LEN = 96
 AVAHI_TIMEOUT_SEC = 5.0
 
 UUID_RE = re.compile(
@@ -62,6 +65,89 @@ def unescape_avahi(value: str) -> str:
         return raw
 
 
+def sanitize_text(value: str, max_len: int = MAX_FIELD_LEN) -> str:
+    """Strip markup / controls / bidi spoofing from LAN-controlled strings."""
+    text = value or ""
+    text = text.replace("<", "").replace(">", "")
+    text = re.sub(r"[\x00-\x1f\x7f]", "", text)
+    text = re.sub(r"[\u200b-\u200f\u202a-\u202e\u2066-\u2069]", "", text)
+    text = re.sub(r"[\U000e0000-\U000e007f]", "", text)
+    if len(text) > max_len:
+        text = text[:max_len]
+    return text
+
+
+def _read_pipe_capped(pipe, limit: int, sink: list[bytes]) -> None:
+    """Read from a pipe, retaining at most `limit` bytes in memory."""
+    total = 0
+    try:
+        while True:
+            chunk = pipe.read(65536)
+            if not chunk:
+                break
+            if total >= limit:
+                continue
+            take = chunk[: limit - total]
+            if take:
+                sink.append(take)
+                total += len(take)
+    finally:
+        try:
+            pipe.close()
+        except OSError:
+            pass
+
+
+def scan_avahi() -> tuple[dict[str, dict[str, Any]], str | None]:
+    binary = which("avahi-browse")
+    if not binary:
+        return {}, "avahi-browse not found (install avahi)"
+    try:
+        proc = subprocess.Popen(
+            [binary, "-artp"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as exc:
+        return {}, sanitize_text(str(exc), 160)
+
+    out_chunks: list[bytes] = []
+    err_chunks: list[bytes] = []
+    t_out = threading.Thread(
+        target=_read_pipe_capped,
+        args=(proc.stdout, MAX_AVAHI_BYTES, out_chunks),
+        daemon=True,
+    )
+    t_err = threading.Thread(
+        target=_read_pipe_capped,
+        args=(proc.stderr, 4096, err_chunks),
+        daemon=True,
+    )
+    t_out.start()
+    t_err.start()
+    timed_out = False
+    try:
+        proc.wait(timeout=AVAHI_TIMEOUT_SEC)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        proc.kill()
+        try:
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+    t_out.join(timeout=1)
+    t_err.join(timeout=1)
+
+    text = b"".join(out_chunks).decode("utf-8", "replace")
+    if timed_out:
+        return parse_avahi(text), None
+    if proc.returncode not in (0, None) and not text:
+        err = b"".join(err_chunks).decode("utf-8", "replace").strip()
+        err = err or f"avahi-browse exited {proc.returncode}"
+        return {}, sanitize_text(err, 160)
+    return parse_avahi(text), None
+
+
 def clean_display_name(name: str) -> str:
     text = unescape_avahi(name).strip()
     # Drop AirPlay "MAC@Name" / "id@Name" prefixes when the rest is human.
@@ -74,7 +160,7 @@ def clean_display_name(name: str) -> str:
         text = text.split("@", 1)[1].strip()
     text = text.replace("___", "'").replace("_", " ")
     text = re.sub(r"\s+", " ", text).strip()
-    return text
+    return sanitize_text(text, MAX_NAME_LEN)
 
 
 def is_junk_name(name: str) -> bool:
@@ -133,7 +219,10 @@ def parse_txt_fields(fields: list[str]) -> dict[str, str]:
     blob = " ".join(fields[9:]) if len(fields) > 9 else ""
     out: dict[str, str] = {}
     for match in re.finditer(r'"([^"=]+)=([^"]*)"', blob):
-        out[match.group(1)] = unescape_avahi(match.group(2)).strip()
+        key = sanitize_text(unescape_avahi(match.group(1)), 32)
+        if not key:
+            continue
+        out[key] = sanitize_text(unescape_avahi(match.group(2)).strip(), MAX_FIELD_LEN)
     return out
 
 
@@ -272,12 +361,12 @@ def parse_avahi(text: str) -> dict[str, dict[str, Any]]:
             continue
         service = unescape_avahi(fields[4])
         name = clean_display_name(fields[3])
-        host = unescape_avahi(fields[6])
+        host = sanitize_text(unescape_avahi(fields[6]), MAX_FIELD_LEN)
         ip = fields[7].strip()
         if not IPV4_RE.match(ip):
             continue
         txt = parse_txt_fields(fields)
-        txt_name = txt.get("n", "")
+        txt_name = sanitize_text(txt.get("n", ""), MAX_NAME_LEN)
         if txt_name and (is_junk_name(name) or name_score(txt_name, local_from_host(host)) >= name_score(name, local_from_host(host))):
             name = clean_display_name(txt_name)
         local = local_from_host(host)
@@ -298,29 +387,6 @@ def parse_avahi(text: str) -> dict[str, dict[str, Any]]:
             },
         )
     return hosts
-
-
-def scan_avahi() -> tuple[dict[str, dict[str, Any]], str | None]:
-    binary = which("avahi-browse")
-    if not binary:
-        return {}, "avahi-browse not found (install avahi)"
-    try:
-        proc = subprocess.run(
-            [binary, "-artp"],
-            capture_output=True,
-            text=True,
-            timeout=AVAHI_TIMEOUT_SEC,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        text = (exc.stdout or "") if isinstance(exc.stdout, str) else (exc.stdout or b"").decode("utf-8", "replace")
-        return parse_avahi(text), None
-    except OSError as exc:
-        return {}, str(exc)
-    if proc.returncode not in (0, None) and not proc.stdout:
-        err = (proc.stderr or "").strip() or f"avahi-browse exited {proc.returncode}"
-        return {}, err
-    return parse_avahi(proc.stdout or ""), None
 
 
 def ensure_gateway(hosts: dict[str, dict[str, Any]]) -> None:
@@ -368,14 +434,21 @@ def finalize(hosts: dict[str, dict[str, Any]], self_entry: dict[str, Any]) -> li
     )
     out = []
     for row in rows[:MAX_HOSTS]:
+        ip = sanitize_text(str(row.get("ip") or ""), 45)
+        local = sanitize_text(str(row.get("local") or ""), MAX_FIELD_LEN)
+        hostname = sanitize_text(str(row.get("hostname") or ""), MAX_NAME_LEN)
+        name = sanitize_text(
+            str(row.get("name") or hostname or ip or "Unknown"),
+            MAX_NAME_LEN,
+        )
         out.append(
             {
-                "id": row.get("id") or row.get("ip") or row.get("local"),
-                "name": row.get("name") or row.get("hostname") or row.get("ip") or "Unknown",
-                "hostname": row.get("hostname") or "",
-                "local": row.get("local") or "",
-                "ip": row.get("ip") or "",
-                "kind": row.get("kind") or "other",
+                "id": sanitize_text(str(row.get("id") or ip or local), MAX_FIELD_LEN),
+                "name": name,
+                "hostname": hostname,
+                "local": local,
+                "ip": ip,
+                "kind": sanitize_text(str(row.get("kind") or "other"), 24),
                 "self": bool(row.get("self")),
             }
         )
@@ -387,10 +460,10 @@ def cmd_scan() -> int:
     hosts, error = scan_avahi()
     ensure_gateway(hosts)
     payload = {
-        "iface": iface,
-        "selfIp": ip,
+        "iface": sanitize_text(iface, 32),
+        "selfIp": sanitize_text(ip, 45),
         "hosts": finalize(hosts, self_host(iface, ip)),
-        "error": error,
+        "error": sanitize_text(error, 160) if error else None,
     }
     json.dump(payload, sys.stdout, separators=(",", ":"))
     sys.stdout.write("\n")
