@@ -8,6 +8,8 @@ Uses **mDNS** (`avahi-browse`) so each host can show:
 - IPv4 address
 - `.local` hostname when advertised
 
+![Network Devices overlay](preview.png)
+
 ## Install
 
 ```sh
